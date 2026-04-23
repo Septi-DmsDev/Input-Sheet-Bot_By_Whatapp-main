@@ -22,6 +22,7 @@ const WEBHOOK_MAX_RETRIES = Number(process.env.WEBHOOK_MAX_RETRIES || 3);
 const WEBHOOK_RETRY_DELAY_MS = Number(process.env.WEBHOOK_RETRY_DELAY_MS || 2000);
 const WEBHOOK_FAILURE_LOG = process.env.WEBHOOK_FAILURE_LOG || './failed_webhooks.ndjson';
 const SHEETS_REQUEST_MIN_INTERVAL_MS = Number(process.env.SHEETS_REQUEST_MIN_INTERVAL_MS || 1100);
+const SHEETS_INDEX_CACHE_TTL_MS = Number(process.env.SHEETS_INDEX_CACHE_TTL_MS || 900000);
 const SHEETS_LOOKUP_CACHE_TTL_MS = Number(process.env.SHEETS_LOOKUP_CACHE_TTL_MS || 21600000);
 const SHEETS_NEGATIVE_LOOKUP_CACHE_TTL_MS = Number(process.env.SHEETS_NEGATIVE_LOOKUP_CACHE_TTL_MS || 300000);
 const SHEETS_429_RETRY_DELAY_MS = Number(process.env.SHEETS_429_RETRY_DELAY_MS || 15000);
@@ -62,6 +63,7 @@ let lastSheetsRequestAt = 0;
 let reportGroupJidCache = null;
 let isReportDispatchRunning = false;
 const sheetsRowCache = new Map();
+const sheetsIndexCache = new Map();
 
 function normalizeJid(jid) {
     return jid ? jid.replace(/:\d+@/, '@') : jid;
@@ -103,6 +105,10 @@ function getSheetsLookupCacheKey(spreadsheetId, sheetName, kode, lookupColumn) {
     return [spreadsheetId, sheetName, lookupColumn, normalizeCellValue(kode)].join('::');
 }
 
+function getSheetsIndexCacheKey(spreadsheetId, sheetName, lookupColumn) {
+    return [spreadsheetId, sheetName, lookupColumn].join('::');
+}
+
 function getCachedRowLookup(cacheKey) {
     const cached = sheetsRowCache.get(cacheKey);
     if (!cached) {
@@ -129,6 +135,58 @@ function setCachedRowLookup(cacheKey, rowNumber, ttlMs) {
         'SET',
         `key=${cacheKey} row=${rowNumber === null ? 'null' : rowNumber} ttlMs=${ttlMs} size=${sheetsRowCache.size}`
     );
+}
+
+function getCachedSheetIndex(cacheKey) {
+    const cached = sheetsIndexCache.get(cacheKey);
+    if (!cached) {
+        logSheetsCache('INDEX_MISS', `key=${cacheKey}`);
+        return null;
+    }
+
+    if (cached.expiresAt <= Date.now()) {
+        sheetsIndexCache.delete(cacheKey);
+        logSheetsCache('INDEX_EXPIRE', `key=${cacheKey}`);
+        return null;
+    }
+
+    logSheetsCache('INDEX_HIT', `key=${cacheKey} size=${cached.rowsByKode.size}`);
+    return cached.rowsByKode;
+}
+
+function setCachedSheetIndex(cacheKey, rowsByKode, ttlMs) {
+    sheetsIndexCache.set(cacheKey, {
+        rowsByKode,
+        expiresAt: Date.now() + ttlMs
+    });
+    logSheetsCache('INDEX_SET', `key=${cacheKey} size=${rowsByKode.size} ttlMs=${ttlMs}`);
+}
+
+async function getSheetRowIndex({ sheets, spreadsheetId, sheetName, lookupColumn = 1 }) {
+    const cacheKey = getSheetsIndexCacheKey(spreadsheetId, sheetName, lookupColumn);
+    const cachedIndex = getCachedSheetIndex(cacheKey);
+    if (cachedIndex) {
+        return cachedIndex;
+    }
+
+    const lookupLetter = columnNumberToLetter(lookupColumn);
+    const range = getSheetRange(sheetName, `${lookupLetter}:${lookupLetter}`);
+    const res = await runSheetsRequest(() => sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range
+    }));
+
+    const rows = res.data.values || [];
+    const rowsByKode = new Map();
+
+    for (let index = 0; index < rows.length; index += 1) {
+        const normalizedKode = normalizeCellValue(rows[index]?.[0]);
+        if (!normalizedKode || rowsByKode.has(normalizedKode)) continue;
+        rowsByKode.set(normalizedKode, index + 1);
+    }
+
+    setCachedSheetIndex(cacheKey, rowsByKode, SHEETS_INDEX_CACHE_TTL_MS);
+    return rowsByKode;
 }
 
 function truncate(value, max = 300) {
@@ -839,22 +897,18 @@ async function findRowByKode({ sheets, spreadsheetId, sheetName, kode, lookupCol
         return cachedRowNumber;
     }
 
-    const lookupLetter = columnNumberToLetter(lookupColumn);
-    const range = getSheetRange(sheetName, `${lookupLetter}:${lookupLetter}`);
-    const res = await runSheetsRequest(() => sheets.spreadsheets.values.get({
+    const rowsByKode = await getSheetRowIndex({
+        sheets,
         spreadsheetId,
-        range
-    }));
-
-    const rows = res.data.values || [];
+        sheetName,
+        lookupColumn
+    });
     const targetKode = normalizeCellValue(kode);
+    const rowNumber = rowsByKode.get(targetKode) || null;
 
-    for (let index = 0; index < rows.length; index += 1) {
-        if (normalizeCellValue(rows[index]?.[0]) === targetKode) {
-            const rowNumber = index + 1;
-            setCachedRowLookup(cacheKey, rowNumber, SHEETS_LOOKUP_CACHE_TTL_MS);
-            return rowNumber;
-        }
+    if (rowNumber) {
+        setCachedRowLookup(cacheKey, rowNumber, SHEETS_LOOKUP_CACHE_TTL_MS);
+        return rowNumber;
     }
 
     setCachedRowLookup(cacheKey, null, SHEETS_NEGATIVE_LOOKUP_CACHE_TTL_MS);
