@@ -1,0 +1,28 @@
+npm install pastikan punya file package.json
+
+
+jalankan node index.js
+
+
+npm uninstall whatsapp-web.js puppeteer-core
+npm install @whiskeysockets/baileys pino qrcode-terminal node-fetch@2
+
+pm2 start index.js --name wa-bot
+pm2 save
+pm2 startup
+
+buat pintasan run-pm2
+shell:startup
+
+
+Perintah             | Fungsi                      |
+| -------------------- | --------------------------- |
+| pm2 list           | Lihat semua bot yang aktif  |
+| pm2 stop wa-bot    | Hentikan bot                |
+| pm2 restart wa-bot | Restart bot                 |
+| pm2 logs wa-bot    | Lihat log error & aktivitas 
+
+
+pm2 resurrect
+
+cek status
