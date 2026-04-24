@@ -17,6 +17,9 @@ const RECONNECT_DELAY_MS = Number(process.env.WA_RECONNECT_DELAY_MS || 5000);
 const LIVENESS_INTERVAL_MS = Number(process.env.WA_LIVENESS_INTERVAL_MS || 120000);
 const LIVENESS_TIMEOUT_MS = Number(process.env.WA_LIVENESS_TIMEOUT_MS || 15000);
 const LIVENESS_MAX_FAILURES = Number(process.env.WA_LIVENESS_MAX_FAILURES || 2);
+const REACT_INITIAL_DELAY_MS = Number(process.env.WA_REACT_INITIAL_DELAY_MS || 1500);
+const REACT_MAX_RETRIES = Number(process.env.WA_REACT_MAX_RETRIES || 3);
+const REACT_RETRY_DELAY_MS = Number(process.env.WA_REACT_RETRY_DELAY_MS || 1200);
 const WEBHOOK_TIMEOUT_MS = Number(process.env.WEBHOOK_TIMEOUT_MS || 20000);
 const WEBHOOK_MAX_RETRIES = Number(process.env.WEBHOOK_MAX_RETRIES || 3);
 const WEBHOOK_RETRY_DELAY_MS = Number(process.env.WEBHOOK_RETRY_DELAY_MS || 2000);
@@ -353,12 +356,35 @@ function shutdown(signal) {
 }
 
 async function safeReact(sock, jid, key, emoji) {
-    try {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        await sock.sendMessage(jid, { react: { text: emoji, key } });
-    } catch (e) {
-        console.error(`Gagal react ${emoji}:`, e.message);
+    if (REACT_INITIAL_DELAY_MS > 0) {
+        await sleep(REACT_INITIAL_DELAY_MS);
     }
+
+    let lastError = null;
+    const keyId = key?.id || 'unknown';
+
+    for (let attempt = 1; attempt <= REACT_MAX_RETRIES; attempt += 1) {
+        try {
+            await sock.sendMessage(jid, { react: { text: emoji, key } });
+
+            if (attempt > 1) {
+                console.log(`[REACT] RECOVERED emoji=${emoji} attempt=${attempt} id=${keyId}`);
+            }
+
+            return true;
+        } catch (e) {
+            lastError = e;
+            const message = e?.message || String(e);
+            console.error(`[REACT] FAIL attempt=${attempt}/${REACT_MAX_RETRIES} emoji=${emoji} id=${keyId} error=${message}`);
+
+            if (attempt < REACT_MAX_RETRIES) {
+                await sleep(REACT_RETRY_DELAY_MS * attempt);
+            }
+        }
+    }
+
+    console.error(`[REACT] GIVEUP emoji=${emoji} id=${keyId} error=${lastError?.message || 'unknown'}`);
+    return false;
 }
 
 function appendWebhookFailure(entry) {
@@ -1324,7 +1350,7 @@ async function connectToWhatsApp() {
                         await safeReact(sock, from, msg.key, isCut ? '✂️' : '🖨️');
                     }
                 } catch (err) {
-                    console.error('Error Webhook Printing:', err.message);
+                    console.error('Error Datasink Printing:', err.message);
                 }
             }
 
@@ -1377,7 +1403,7 @@ async function connectToWhatsApp() {
                         await safeReact(sock, from, msg.key, target.emo);
                     }
                 } catch (err) {
-                    console.error('Error Webhook Finishing:', err.message);
+                    console.error('Error Datasink Finishing:', err.message);
                 }
             }
 
@@ -1420,7 +1446,7 @@ async function connectToWhatsApp() {
                             await safeReact(sock, from, msg.key, '🎀');
                         }
                     } catch (err) {
-                        console.error('Error Webhook CSM:', err.message);
+                        console.error('Error Datasink CSM:', err.message);
                     }
                 }
             }
@@ -1434,8 +1460,9 @@ async function connectToWhatsApp() {
             if (!match) continue;
 
             const [_, prefix, number, kodeFix, namaPetugas] = match;
-                const config = sheetsConfig[prefix.toUpperCase()];
+            const config = sheetsConfig[prefix.toUpperCase()];
             if (!config?.webhook) continue;
+            const kode = `${prefix.toUpperCase()} ${number}`;
 
             const { day, month, hour, minute } = getJakartaDateParts();
 
@@ -1452,7 +1479,7 @@ async function connectToWhatsApp() {
 
             try {
                 const payload = {
-                    kode: `${prefix.toUpperCase()} ${number}`,
+                    kode,
                     sheet: config.sheet,
                     timestamp,
                     kolom: kolomTarget,
@@ -1466,7 +1493,7 @@ async function connectToWhatsApp() {
                     recordRekapEvent({
                         prefix,
                         number,
-                        kode: `${prefix.toUpperCase()} ${number}`,
+                        kode,
                         divisi: 'DESAIN',
                         subDivisi: kodeFix && FIXED_TIMES[kodeFix] ? 'FIX' : 'DESAIN',
                         petugas: namaPetugas,
@@ -1477,7 +1504,7 @@ async function connectToWhatsApp() {
                     await safeReact(sock, from, msg.key, '✅');
                 }
             } catch (err) {
-                console.error('Error Webhook Desain:', err.message);
+                console.error('Error Datasink Desain:', err.message);
             }
         }
     });
